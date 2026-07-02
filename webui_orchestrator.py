@@ -44,8 +44,14 @@ def _get_configured_key(key_name: str) -> str:
     configured = str(NVIDIA_KEYS.get(key_name, "")).strip()
     if configured:
         return configured
+
     env_name = key_name.upper()
-    return str(os.getenv(env_name, "")).strip()
+    env_value = str(os.getenv(env_name, "")).strip()
+    if env_value:
+        return env_value
+
+    legacy_env_name = env_name.replace("KEY", "_KEY")
+    return str(os.getenv(legacy_env_name, "")).strip()
 
 
 def _request_with_retries(url: str, headers: dict, payload: dict, timeout: int = 45):
@@ -81,11 +87,11 @@ def generate_avatar_image(prompt: str):
     }
     payload = {
         "prompt": prompt[:220],
-        "width": 512,
-        "height": 512,
-        "cfg_scale": 0,
+        "width": 1024,
+        "height": 1024,
+        "cfg_scale": 1,
         "samples": 1,
-        "seed": 0,
+        "seed": 42,
         "steps": 2
     }
     output_path = ROOT / "portrait.jpg"

@@ -1,12 +1,14 @@
 {
   "nvidia_keys": {
-    "minimax_m3_key": "",
-    "flux_klein_key": "",
-    "qwen_image_key": ""
+    "minimax_m3_key": "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",
+    "flux_klein_key": "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",
+    "qwen_image_key": "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"
   },
   "settings": {
     "VIRTUAL_CAM_WIDTH": 1280,
     "VIRTUAL_CAM_HEIGHT": 720,
-    "SUBPROCESS_TIMEOUT_SEC": 45
+    "SUBPROCESS_TIMEOUT_SEC": 45,
+    "API_MAX_ATTEMPTS": 3,
+    "API_RETRY_DELAY_SEC": 4.0
   }
 }
