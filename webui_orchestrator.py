@@ -36,62 +36,81 @@ NVIDIA_KEYS = config.get("nvidia_keys", {})
 SETTINGS = config.get("settings", {})
 SUBPROCESS_TIMEOUT = int(SETTINGS.get("SUBPROCESS_TIMEOUT_SEC", 45))
 MODEL_CHECKPOINT = ROOT / "checkpoints" / "wav2lip_256.onnx"
+API_MAX_ATTEMPTS = int(SETTINGS.get("API_MAX_ATTEMPTS", 3))
+API_RETRY_DELAY_SEC = float(SETTINGS.get("API_RETRY_DELAY_SEC", 4.0))
 
-FALLBACK_RESPONSES = [
-    "Localized response generated to bypass API congestion limits.",
-    "System checkpoint verified. The offline talking engine is fully ready.",
-    "CPU resource limitations accepted. Ready to execute the animation task."
-]
+
+def _get_configured_key(key_name: str) -> str:
+    configured = str(NVIDIA_KEYS.get(key_name, "")).strip()
+    if configured:
+        return configured
+    env_name = key_name.upper()
+    return str(os.getenv(env_name, "")).strip()
+
+
+def _request_with_retries(url: str, headers: dict, payload: dict, timeout: int = 45):
+    last_error = None
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                return response
+            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+            if response.status_code in {400, 401, 403, 404}:
+                break
+        except requests.Timeout as exc:
+            last_error = f"request timeout: {exc}"
+        except requests.RequestException as exc:
+            last_error = f"connection issue: {exc}"
+        if attempt < API_MAX_ATTEMPTS:
+            time.sleep(API_RETRY_DELAY_SEC * attempt)
+    raise RuntimeError(last_error or "API request failed")
 
 
 def generate_avatar_image(prompt: str):
-    """Calls the NVIDIA Flux endpoint when a key is available; otherwise returns a local placeholder."""
-    if not str(NVIDIA_KEYS.get("flux_klein_key", "")).strip():
-        output_path = ROOT / "temp_staging" / "placeholder_avatar.jpg"
-        if not output_path.exists():
-            img = 255 * np.ones((512, 512, 3), dtype=np.uint8)
-            cv2.imwrite(str(output_path), img)
-        return True, str(output_path)
+    """Calls the NVIDIA Flux endpoint and retries on transient failures; never fabricates output."""
+    api_key = _get_configured_key("flux_klein_key")
+    if not api_key:
+        return False, "No NVIDIA Flux API key configured. Add it to config.json or set FLUX_KLEIN_KEY before generating an image."
 
     invoke_url = "https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.2-klein-4b"
     headers = {
-        "Authorization": f"Bearer {NVIDIA_KEYS.get('flux_klein_key', '')}",
+        "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
         "Content-Type": "application/json"
     }
     payload = {
-        "prompt": prompt,
-        "width": 1024,
-        "height": 1024,
+        "prompt": prompt[:220],
+        "width": 512,
+        "height": 512,
         "cfg_scale": 0,
         "samples": 1,
         "seed": 0,
-        "steps": 4
+        "steps": 2
     }
     output_path = ROOT / "portrait.jpg"
     try:
-        response = requests.post(invoke_url, headers=headers, json=payload, timeout=25)
-        if response.status_code == 200:
-            data = response.json()
-            if "artifacts" in data and len(data["artifacts"]) > 0:
-                base64_data = data["artifacts"][0]["base64"]
-                img_data = base64.b64decode(base64_data)
-                output_path.write_bytes(img_data)
-                return True, str(output_path)
-            return False, f"API Response Structure Error: {data}"
-        return False, f"API Error: HTTP {response.status_code} - {response.text}"
+        response = _request_with_retries(invoke_url, headers, payload, timeout=45)
+        data = response.json()
+        if "artifacts" in data and len(data["artifacts"]) > 0:
+            base64_data = data["artifacts"][0]["base64"]
+            img_data = base64.b64decode(base64_data)
+            output_path.write_bytes(img_data)
+            return True, str(output_path)
+        return False, f"Unexpected image response structure: {data}"
     except Exception as exc:
-        return False, f"Exception during execution: {exc}"
+        return False, f"Avatar generation failed after {API_MAX_ATTEMPTS} attempts: {exc}"
 
 
-def get_minimax_response(user_prompt: str, word_limit: int) -> str:
-    """Calls the NVIDIA MiniMax endpoint when a key is present; otherwise uses a local fallback."""
-    if not str(NVIDIA_KEYS.get("minimax_m3_key", "")).strip():
-        return random.choice(FALLBACK_RESPONSES)
+def get_minimax_response(user_prompt: str, word_limit: int):
+    """Calls the NVIDIA MiniMax endpoint and retries on transient failures; never fabricates a response."""
+    api_key = _get_configured_key("minimax_m3_key")
+    if not api_key:
+        return False, "No NVIDIA MiniMax API key configured. Add it to config.json or set MINIMAX_M3_KEY before generating speech."
 
     invoke_url = "https://integrate.api.nvidia.com/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {NVIDIA_KEYS.get('minimax_m3_key', '')}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     system_instruction = f"Respond in {word_limit} words or less. Keep responses extremely brief and single-sentence."
@@ -99,23 +118,22 @@ def get_minimax_response(user_prompt: str, word_limit: int) -> str:
         "model": "minimaxai/minimax-m3",
         "messages": [
             {"role": "system", "content": system_instruction},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt[:220]}
         ],
-        "max_tokens": 128,
-        "temperature": 0.8,
-        "top_p": 0.95,
+        "max_tokens": 96,
+        "temperature": 0.7,
+        "top_p": 0.9,
         "stream": False
     }
     try:
-        response = requests.post(invoke_url, headers=headers, json=payload, timeout=20)
-        if response.status_code == 200:
-            result = response.json()
-            return result["choices"][0]["message"]["content"].strip()
-        print(f"[NVIDIA API Warning] Status code: {response.status_code}. Swapping to offline mode.")
-        return random.choice(FALLBACK_RESPONSES)
+        response = _request_with_retries(invoke_url, headers, payload, timeout=35)
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        if not content:
+            return False, "MiniMax returned an empty response."
+        return True, content
     except Exception as exc:
-        print(f"[NVIDIA API Connection Issue] {exc}. Swapping to offline mode.")
-        return random.choice(FALLBACK_RESPONSES)
+        return False, f"Text generation failed after {API_MAX_ATTEMPTS} attempts: {exc}"
 
 
 def generate_voice_file_sync(text: str, output_path: str):
@@ -127,7 +145,7 @@ def generate_voice_file_sync(text: str, output_path: str):
 
 
 def process_talking_avatar(avatar_path: str, prompt: str, word_limit: int):
-    """Creates a talking head video using a lightweight local fallback if the ONNX model is absent."""
+    """Creates a talking-head video from real API output only; no placeholder generation."""
     if not avatar_path or not os.path.exists(avatar_path):
         return "Missing valid image file", None
 
@@ -136,7 +154,9 @@ def process_talking_avatar(avatar_path: str, prompt: str, word_limit: int):
     generated_file = str(ROOT / "results" / f"output_{timestamp}.mp4")
 
     try:
-        response_text = get_minimax_response(prompt, word_limit)
+        success, response_text = get_minimax_response(prompt, word_limit)
+        if not success:
+            raise RuntimeError(response_text)
         print(f"[Text Output] {response_text}")
 
         generate_voice_file_sync(response_text, audio_path)
@@ -144,20 +164,10 @@ def process_talking_avatar(avatar_path: str, prompt: str, word_limit: int):
             raise Exception("Corrupt or empty audio file created.")
 
         if not MODEL_CHECKPOINT.exists():
-            print("[Model Warning] Wav2Lip ONNX model missing; generating a lightweight fallback video instead.")
-            img = cv2.imread(avatar_path)
-            if img is None:
-                raise Exception("Avatar image could not be read.")
-            video_writer = cv2.VideoWriter(generated_file, cv2.VideoWriter_fourcc(*"mp4v"), 12.0, (img.shape[1], img.shape[0]))
-            if not video_writer.isOpened():
-                raise Exception("Video writer could not be initialized.")
-            for _ in range(48):
-                video_writer.write(img)
-            video_writer.release()
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-            gc.collect()
-            return f"Fallback video generated successfully: '{response_text}'", generated_file
+            raise FileNotFoundError(f"Wav2Lip ONNX model missing at {MODEL_CHECKPOINT}")
+
+        if not (ROOT / "inference_onnxModel.py").exists():
+            raise FileNotFoundError("Wav2Lip inference script missing")
 
         cmd = [
             sys.executable,
@@ -190,7 +200,7 @@ def process_talking_avatar(avatar_path: str, prompt: str, word_limit: int):
     except subprocess.TimeoutExpired:
         if os.path.exists(audio_path):
             os.remove(audio_path)
-        return "Processing timeout exceeded on local CPU thread constraints.", None
+        return "Processing timeout exceeded on local CPU thread constraints. Please retry with a shorter prompt.", None
     except Exception as exc:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -215,7 +225,7 @@ tab1, tab2 = st.tabs(["1. Generate/Edit Avatar Portrait", "2. Generate Talking H
 
 with tab1:
     st.header("Generate a Custom Speaker Avatar")
-    st.write("Write an instruction to generate a portrait. The image is stored for the video tab.")
+    st.write("Write an instruction to generate a portrait. The app will retry a few times if the NVIDIA endpoint is busy instead of pretending success.")
     flux_input = st.text_input(
         "Describe the Speaker Face:",
         "A realistic front-facing portrait of a professional corporate assistant, looking directly into the camera, plain neutral background, soft studio lighting"
@@ -224,7 +234,7 @@ with tab1:
         if not flux_input.strip():
             st.error("Please enter a valid prompt.")
         else:
-            with st.spinner("Calling the avatar generation path..."):
+            with st.spinner("Calling the avatar generation API and waiting for a successful response..."):
                 success, result = generate_avatar_image(flux_input)
                 if success:
                     st.session_state.avatar_path = result
@@ -266,8 +276,8 @@ with tab2:
                 st.warning("Please type a message prompt.")
             else:
                 status_placeholder = st.empty()
-                status_placeholder.info("Initializing the speech and animation pipeline...")
-                with st.spinner("Processing with the local CPU-safe pipeline..."):
+                status_placeholder.info("Initializing the speech and animation pipeline and waiting for the API responses...")
+                with st.spinner("Processing with retries for the NVIDIA API calls..."):
                     status, video_path = process_talking_avatar(avatar_file, text_prompt, word_limit_slider)
                     if video_path and os.path.exists(video_path):
                         status_placeholder.success(status)
