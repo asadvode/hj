@@ -1,0 +1,12 @@
+{
+  "nvidia_keys": {
+    "minimax_m3_key": "",
+    "flux_klein_key": "",
+    "qwen_image_key": ""
+  },
+  "settings": {
+    "VIRTUAL_CAM_WIDTH": 1280,
+    "VIRTUAL_CAM_HEIGHT": 720,
+    "SUBPROCESS_TIMEOUT_SEC": 45
+  }
+}
